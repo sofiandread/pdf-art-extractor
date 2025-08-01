@@ -35,7 +35,7 @@ app.post('/extract-svg', upload.single('data'), async (req, res) => {
   try {
     // ----- Convert the uploaded PDF to SVG via ConvertAPI -----
     //           dest fmt  params                     src fmt
-    const result = await convertapi.convert('svg', { File: pdfPath }, 'pdf');
+    const result = await convertapi.convert('svg', { File: pdfPath });
 
     // ----- Save the resulting SVGs to /tmp and read them back -----
     const savedPaths = await result.saveFiles('/tmp');         // [ '/tmp/<uuid>-1.svg', … ]
