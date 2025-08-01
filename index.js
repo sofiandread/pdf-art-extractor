@@ -27,6 +27,31 @@ app.post('/extract-svg', upload.single('data'), async (req, res) => {
     return res.status(400).json({ error: 'No file uploaded under field "data"' });
   }
 
+  // Multer gives us a tmp path **without extension** (e.g. /tmp/abcd1234)
+  const originalPath = req.file.path;
+  const tmpPdfPath   = `${originalPath}.pdf`; // add explicit .pdf extension so ConvertAPI can detect type
+
+  try {
+    // Rename the file so it ends with .pdf (ConvertAPI relies on extension)
+    await fs.rename(originalPath, tmpPdfPath);
+
+    const result = await convertapi.convert('svg', { File: tmpPdfPath }, 'pdf');
+
+    const savedPaths = await result.saveFiles('/tmp');
+    const svgPages  = await Promise.all(savedPaths.map(p => fs.readFile(p, 'utf-8')));
+
+    // Clean up
+    await Promise.all(savedPaths.map(p => fs.unlink(p).catch(() => {})));
+    await fs.unlink(tmpPdfPath).catch(() => {});
+
+    return res.json({ svgPages });
+  } catch (err) {
+    console.error('❌ /extract-svg failed:', err.response?.data || err);
+    return res.status(500).json({ error: err.message || 'Conversion failed' });
+  }
+});
+  }
+
   const pdfPath = req.file.path; // temp PDF
 
   try {
