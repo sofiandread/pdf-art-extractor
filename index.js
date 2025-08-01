@@ -1,41 +1,59 @@
+// index.js – Express API for PDF → SVG extraction via ConvertAPI
+// --------------------------------------------------------------
+// Prerequisites (added to package.json):
+//   "express", "multer", "convertapi", "dotenv" (optional but convenient)
+// --------------------------------------------------------------
+
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
-const fileUpload = multer({ storage: multer.memoryStorage() });
-const { PDFDocument } = require('pdf-lib');
+const fs = require('fs').promises;
+const path = require('path');
+const ConvertAPI = require('convertapi');
+
+// Initialise ConvertAPI with the secret/token injected via Railway env vars
+const convertapi = new ConvertAPI(process.env.CONVERT_API_SECRET);
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+// Store uploads on disk (ConvertAPI needs a path to read from)
+const upload = multer({ dest: '/tmp' });
 
-app.get('/', (req, res) => {
-  res.send('✅ Hello from the fresh API!');
-});
+/**
+ * POST /extract-svg
+ * Body (multipart/form-data): { data: <PDF binary> }
+ *   – we keep the field name **data** so you don’t have to touch your existing n8n node.
+ * Response: { svgPages: ["<svg>…</svg>", "<svg>…</svg>", …] }
+ */
+app.post('/extract-svg', upload.single('data'), async (req, res) => {
+  // Guard – must have a file attached
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded under field "data"' });
+  }
 
-// SVG extraction endpoint
-app.post('/extract-svg', fileUpload.single('data'), async (req, res) => {
+  const pdfPath = req.file.path; // tmp path where Multer saved the PDF
+
   try {
-    const pdfBuffer = req.file.buffer;
-    const pdfDoc = await PDFDocument.load(pdfBuffer);
+    // ----- Convert the uploaded PDF to SVG via ConvertAPI -----
+    //           dest fmt  params                     src fmt
+    const result = await convertapi.convert('svg', { File: pdfPath }, 'pdf');
 
-    const pages = pdfDoc.getPages();
-    const svgResults = [];
+    // ----- Save the resulting SVGs to /tmp and read them back -----
+    const savedPaths = await result.saveFiles('/tmp');         // [ '/tmp/<uuid>-1.svg', … ]
+    const svgPages   = await Promise.all(savedPaths.map(p => fs.readFile(p, 'utf-8')));
 
-    for (let i = 0; i < pages.length; i++) {
-      const page = pages[i];
-      const { width, height } = page.getSize();
+    // Clean up temp files (best‑effort)
+    await Promise.all(savedPaths.map(p => fs.unlink(p).catch(() => {})));
+    await fs.unlink(pdfPath).catch(() => {});
 
-      // Since pdf-lib does not support SVG extraction, we simulate it
-      svgResults.push(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-  <text x="10" y="20">[Simulated SVG from page ${i + 1}]</text>
-</svg>`);
-    }
-
-    res.json({ svgPages: svgResults });
+    return res.json({ svgPages });
   } catch (err) {
-    console.error('Error extracting SVG:', err);
-    res.status(500).json({ error: 'Failed to extract SVG' });
+    console.error('❌ /extract-svg failed:', err);
+    return res.status(500).json({ error: err.message || 'Conversion failed' });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// Basic health‑check
+app.get('/', (_, res) => res.send('🟢 PDF‑QA API running'));
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
