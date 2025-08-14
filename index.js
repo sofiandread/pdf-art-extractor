@@ -37,6 +37,39 @@ function stripXmlDecl(svgText) {
   return svgText.replace(/^\s*<\?xml[^>]*>\s*/i, '');
 }
 
+function extractRootAttrs(svgText) {
+  // Grab attributes on the outer <svg ...> tag
+  const m = svgText.match(/<svg\b([^>]*)>/i);
+  if (!m) return '';
+  const attrStr = m[1] || '';
+
+  // Keep only namespace-ish attrs (xmlns, xmlns:*, xml:*)
+  const keep = [];
+  const attrRe = /([:\w.-]+)\s*=\s*("[^"]*"|'[^']*')/g;
+  let mm;
+  while ((mm = attrRe.exec(attrStr)) !== null) {
+    const name = mm[1].toLowerCase();
+    const val  = mm[2];
+    if (
+      name === 'xmlns' ||
+      name.startsWith('xmlns:') ||
+      name.startsWith('xml:')
+    ) {
+      keep.push(`${mm[1]}=${val}`);
+    }
+  }
+
+  // Always ensure xlink is present (Illustrator/WebKit often need it for <image xlink:href>)
+  const hasXlink = keep.some(k => /^xmlns:xlink\s*=/.test(k));
+  if (!hasXlink) keep.push('xmlns:xlink="http://www.w3.org/1999/xlink"');
+
+  // Optional but harmless; avoids whitespace collapsing surprises
+  const hasXmlSpace = keep.some(k => /^xml:space\s*=/.test(k));
+  if (!hasXmlSpace) keep.push('xml:space="preserve"');
+
+  return keep.join(' ');
+}
+
 function extractInnerSvg(svgText) {
   const m = svgText.match(/<svg\b[^>]*>([\s\S]*?)<\/svg\s*>/i);
   if (!m) throw new Error('Input is not a valid SVG document');
@@ -48,16 +81,22 @@ function cropSvgString(fullPageSvg, x1, y1, x2, y2) {
   const h = Math.max(0, y2 - y1);
   if (!w || !h) throw new Error('Invalid crop box: zero width/height');
 
-  const inner = extractInnerSvg(stripXmlDecl(fullPageSvg));
+  const src = stripXmlDecl(fullPageSvg);
+  const nsAttrs = extractRootAttrs(src);
+  const inner = extractInnerSvg(src);
 
   // Visual crop: set viewBox to the box size and translate content so the box lands at (0,0)
+  // Keep namespace / xml attrs from the original root, and add standard xmlns just in case.
   return (
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}">` +
-    `<g transform="translate(${-x1},${-y1})">` +
-    inner +
-    `</g></svg>`
+    `<svg xmlns="http://www.w3.org/2000/svg" ${nsAttrs} viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">` +
+      `<g transform="translate(${-x1},${-y1})">` +
+        inner +
+      `</g>` +
+    `</svg>`
   );
 }
+
+
 
 function convertTopLeftToBottomLeft({ x1, y1, x2, y2 }, pageHeight) {
   // If incoming coords have origin at top-left, flip Y using page height
