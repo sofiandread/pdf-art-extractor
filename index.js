@@ -131,33 +131,30 @@ app.post('/extract-svg', upload.single('data'), async (req, res) => {
  * - Visual crop (translate + viewBox). Elements outside the box remain but are off-canvas.
  * - Robust input validation + cleanup to avoid orphaned temp files.
  */
-app.post('/extract-svg-crop', upload.single('data'), async (req, res) => {
+// BEFORE:
+// app.post('/extract-svg-crop', upload.single('data'), async (req, res) => {
+
+// AFTER: accept either 'data' or 'pdf'
+app.post('/extract-svg-crop', upload.any(), async (req, res) => {
   let pdfIn;
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded under field "data"' });
+    // Prefer 'data', else accept 'pdf'
+    const file =
+      (Array.isArray(req.files) && req.files.find(f => f.fieldname === 'data')) ||
+      (Array.isArray(req.files) && req.files.find(f => f.fieldname === 'pdf')) ||
+      req.file || null;
+
+    if (!file) {
+      return res.status(400).json({ error: 'No file uploaded under field "data" or "pdf"' });
     }
 
-    // Parse inputs from multipart text fields
-    const page         = Math.max(1, parseInt(req.body.page, 10) || 1);
-    const coordsOrigin = (req.body.coordsOrigin || 'pdf').toLowerCase(); // 'pdf' or 'topleft'
-
-    let x1 = toNum(req.body.x1);
-    let y1 = toNum(req.body.y1);
-    let x2 = toNum(req.body.x2);
-    let y2 = toNum(req.body.y2);
-
-    if ([x1, y1, x2, y2].some(v => v === undefined)) {
-      return res.status(400).json({ error: 'Missing or invalid crop coordinates x1,y1,x2,y2' });
-    }
-    if (x2 <= x1 || y2 <= y1) {
-      return res.status(400).json({ error: 'Invalid crop box: ensure x2>x1 and y2>y1' });
-    }
-
-    // Rename tmp to .pdf so ConvertAPI detects file type
-    const tmpIn = req.file.path;
+    // Multer gives us a temp path with no extension; add .pdf so ConvertAPI detects the type
+    const tmpIn = file.path;
     pdfIn = `${tmpIn}.pdf`;
     await fs.rename(tmpIn, pdfIn);
+
+    // ... keep your existing code from here (renderFullPageSvgs, page pick, coords, crop, etc.)
+
 
     // Render SVG pages and pick the requested page
     const svgPages = await renderFullPageSvgs(pdfIn);
