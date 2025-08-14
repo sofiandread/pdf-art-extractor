@@ -1,8 +1,4 @@
 // index.js – Express API for PDF → SVG extraction via ConvertAPI
-// -----------------------------------------------------------------------------
-// Dependencies in package.json: express, multer, convertapi, dotenv
-// -----------------------------------------------------------------------------
-
 require('dotenv').config();
 const express     = require('express');
 const multer      = require('multer');
@@ -10,13 +6,10 @@ const fs          = require('fs').promises;
 const ConvertAPI  = require('convertapi');
 
 const convertapi = new ConvertAPI(process.env.CONVERT_API_SECRET);
-
 const app    = express();
-const upload = multer({ dest: '/tmp' }); // Multer temp dir
+const upload = multer({ dest: '/tmp' });
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ───────────────────────────────────────────────────────────────────────────────
+// ───────────────── helpers ─────────────────
 
 const toNum = (v) => {
   if (v === undefined || v === null || v === '') return undefined;
@@ -24,15 +17,16 @@ const toNum = (v) => {
   return Number.isFinite(n) ? n : undefined;
 };
 
-function getPageSizeFromSvg(svgText) {
-  // viewBox="minX minY width height"
-  const m = svgText.match(
-    /viewBox\s*=\s*"[^"]*?(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)/i
-  );
+// Parse full viewBox: minX minY width height
+function getViewBox(svgText) {
+  const m = svgText.match(/viewBox\s*=\s*"(\s*-?\d+(?:\.\d+)?)\s+(\s*-?\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)\s+(\d+(?:\.\d+)?)/i);
   if (!m) return null;
-  const width  = parseFloat(m[3]);
-  const height = parseFloat(m[4]);
-  return { width, height };
+  return {
+    minX: parseFloat(m[1]),
+    minY: parseFloat(m[2]),
+    width: parseFloat(m[3]),
+    height: parseFloat(m[4]),
+  };
 }
 
 function stripXmlDecl(svgText) {
@@ -40,7 +34,6 @@ function stripXmlDecl(svgText) {
 }
 
 function parseRootAttrs(svgText) {
-  // Return a map of attributes on the outer <svg ...> tag
   const m = svgText.match(/<svg\b([^>]*)>/i);
   if (!m) return {};
   const attrStr = m[1] || '';
@@ -49,7 +42,7 @@ function parseRootAttrs(svgText) {
   let mm;
   while ((mm = attrRe.exec(attrStr)) !== null) {
     const name = mm[1];
-    const val  = mm[2].slice(1, -1); // drop quotes
+    const val  = mm[2].slice(1, -1);
     map[name] = val;
   }
   return map;
@@ -61,16 +54,19 @@ function extractInnerSvg(svgText) {
   return m[1];
 }
 
+// Visual crop using correct translation that accounts for viewBox minX/minY
 function cropSvgString(fullPageSvg, x1, y1, x2, y2) {
+  const vb = getViewBox(fullPageSvg);
+  if (!vb) throw new Error('viewBox not found on page SVG');
+
   const w = Math.max(0, x2 - x1);
   const h = Math.max(0, y2 - y1);
   if (!w || !h) throw new Error('Invalid crop box: zero width/height');
 
   const src   = stripXmlDecl(fullPageSvg);
-  const attrs = parseRootAttrs(src);             // original root attrs (may include xmlns/*)
-  const inner = extractInnerSvg(src);
+  const attrs = parseRootAttrs(src);
 
-  // Always include core namespaces; copy over any other xml:/xmlns: attrs without dupes
+  // Always include core namespaces; copy any xml:/xmlns: attrs without dupes
   const ns = {
     'xmlns': 'http://www.w3.org/2000/svg',
     'xmlns:xlink': 'http://www.w3.org/1999/xlink',
@@ -81,29 +77,47 @@ function cropSvgString(fullPageSvg, x1, y1, x2, y2) {
       if (!ns[k]) ns[k] = v;
     }
   }
-  // Helpful default to avoid whitespace surprises
   if (!('xml:space' in ns)) ns['xml:space'] = 'preserve';
 
-  const nsAttrStr = Object.entries(ns)
-    .map(([k, v]) => `${k}="${v}"`)
-    .join(' ');
+  const nsAttrStr = Object.entries(ns).map(([k, v]) => `${k}="${v}"`).join(' ');
+  const inner = extractInnerSvg(src);
 
-  // Visual crop: translate original content; viewBox defines the crop window
+  // Offset must include original minX/minY
+  const dx = -(vb.minX + x1);
+  const dy = -(vb.minY + y1);
+
   return (
     `<svg ${nsAttrStr} viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid meet">` +
-      `<g transform="translate(${-x1},${-y1})">` +
+      `<g transform="translate(${dx},${dy})">` +
         inner +
       `</g>` +
     `</svg>`
   );
 }
 
-function convertTopLeftToBottomLeft({ x1, y1, x2, y2 }, pageHeight) {
-  return { x1, y1: pageHeight - y2, x2, y2: pageHeight - y1 };
+// Raster→SVG mapping with optional scaling + origin flip (top-left → bottom-left)
+function mapBoxToSvg({ x1, y1, x2, y2 }, origin, { rasterW, rasterH, svgW, svgH }) {
+  const sx = rasterW && rasterW > 0 ? svgW / rasterW : 1;
+  const sy = rasterH && rasterH > 0 ? svgH / rasterH : 1;
+
+  let X1 = (x1 ?? 0) * sx;
+  let X2 = (x2 ?? 0) * sx;
+  let Y1 = (y1 ?? 0) * sy;
+  let Y2 = (y2 ?? 0) * sy;
+
+  if (X2 < X1) [X1, X2] = [X2, X1];
+  if (Y2 < Y1) [Y1, Y2] = [Y2, Y1];
+
+  if ((origin || 'pdf').toLowerCase() === 'topleft') {
+    const Y1bl = svgH - Y2;
+    const Y2bl = svgH - Y1;
+    Y1 = Y1bl; Y2 = Y2bl;
+  }
+
+  return { x1: X1, y1: Y1, x2: X2, y2: Y2 };
 }
 
 async function renderFullPageSvgs(pdfTmpPath) {
-  // Convert PDF → SVG (one per page), read contents, cleanup
   const result   = await convertapi.convert('svg', { File: pdfTmpPath }, 'pdf');
   const svgPaths = await result.saveFiles('/tmp');
   try {
@@ -116,26 +130,19 @@ async function renderFullPageSvgs(pdfTmpPath) {
   }
 }
 
-// ───────────────────────────────────────────────────────────────────────────────
-// Routes
-// ───────────────────────────────────────────────────────────────────────────────
+// ───────────── routes ─────────────
 
-// (Existing) POST /extract-svg
-// Body (multipart/form-data): field "data" must contain a PDF file
-// Returns: { svgPages: ["<svg>…</svg>", …] }
+// existing endpoint (unchanged behavior)
 app.post('/extract-svg', upload.single('data'), async (req, res) => {
   let pdfIn;
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded under field "data"' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded under field "data"' });
     const tmpIn = req.file.path;
     pdfIn = `${tmpIn}.pdf`;
     await fs.rename(tmpIn, pdfIn);
 
     const svgPages = await renderFullPageSvgs(pdfIn);
     await fs.unlink(pdfIn).catch(() => {});
-
     return res.json({ svgPages });
   } catch (err) {
     console.error('❌ /extract-svg failed:', err?.response?.data || err);
@@ -143,29 +150,25 @@ app.post('/extract-svg', upload.single('data'), async (req, res) => {
   }
 });
 
-// (New) POST /extract-svg-crop
-// Accepts file under "data" OR "pdf"; fields: page, x1, y1, x2, y2, coordsOrigin ("pdf"|"topleft")
-// Returns JSON with the cropped SVG string and details
+// new: crop endpoint with origin+scaling+minX/minY fix
 app.post('/extract-svg-crop', upload.any(), async (req, res) => {
   let pdfIn;
   try {
-    // 1) Find uploaded file
+    // accept 'data' or 'pdf'
     const file =
       (Array.isArray(req.files) && req.files.find(f => f.fieldname === 'data')) ||
       (Array.isArray(req.files) && req.files.find(f => f.fieldname === 'pdf')) ||
       req.file || null;
 
-    if (!file) {
-      return res.status(400).json({ error: 'No file uploaded under field "data" or "pdf"' });
-    }
+    if (!file) return res.status(400).json({ error: 'No file uploaded under field "data" or "pdf"' });
 
-    // 2) Parse fields
     const page = toNum(req.body.page) ?? 1;
-    let x1 = toNum(req.body.x1);
-    let y1 = toNum(req.body.y1);
-    let x2 = toNum(req.body.x2);
-    let y2 = toNum(req.body.y2);
+    let x1 = toNum(req.body.x1), y1 = toNum(req.body.y1),
+        x2 = toNum(req.body.x2), y2 = toNum(req.body.y2);
     const coordsOrigin = (req.body.coordsOrigin || 'pdf').toLowerCase();
+
+    const rasterW = toNum(req.body.rasterPageWidth);
+    const rasterH = toNum(req.body.rasterPageHeight);
 
     if ([x1, y1, x2, y2].some(v => v === undefined)) {
       return res.status(400).json({ error: 'Missing or invalid x1,y1,x2,y2' });
@@ -174,35 +177,35 @@ app.post('/extract-svg-crop', upload.any(), async (req, res) => {
       return res.status(400).json({ error: 'Invalid crop box: ensure x2>x1 and y2>y1' });
     }
 
-    // 3) Rename tmp upload to .pdf (helps ConvertAPI detect type)
     const tmpIn = file.path;
     pdfIn = `${tmpIn}.pdf`;
     await fs.rename(tmpIn, pdfIn);
 
-    // 4) Render pages, pick page
     const svgPages = await renderFullPageSvgs(pdfIn);
     const pageIdx  = page - 1;
     if (pageIdx < 0 || pageIdx >= svgPages.length) {
-      return res.status(400).json({ error: `Page ${page} out of range (document has ${svgPages.length})` });
+      return res.status(400).json({ error: `Page ${page} out of range (has ${svgPages.length})` });
     }
     const fullPageSvg = svgPages[pageIdx];
 
-    // 5) Optional origin conversion
-    if (coordsOrigin === 'topleft') {
-      const size = getPageSizeFromSvg(fullPageSvg);
-      if (!size) return res.status(400).json({ error: 'Could not read page size from SVG viewBox' });
-      ({ x1, y1, x2, y2 } = convertTopLeftToBottomLeft({ x1, y1, x2, y2 }, size.height));
-    }
+    const vb = getViewBox(fullPageSvg);
+    if (!vb) return res.status(400).json({ error: 'Could not read page viewBox' });
 
-    // 6) Crop
-    const cropped = cropSvgString(fullPageSvg, x1, y1, x2, y2);
+    // map into SVG units with correct origin
+    const mapped = mapBoxToSvg(
+      { x1, y1, x2, y2 },
+      coordsOrigin,
+      { rasterW, rasterH, svgW: vb.width, svgH: vb.height }
+    );
 
-    // 7) Return JSON (keep as text so n8n can use it downstream)
+    const cropped = cropSvgString(fullPageSvg, mapped.x1, mapped.y1, mapped.x2, mapped.y2);
+
     return res.json({
       svg: cropped,
       page,
-      coords: { x1, y1, x2, y2 },
-      origin: coordsOrigin,
+      coords_in: { x1, y1, x2, y2, origin: coordsOrigin, rasterW, rasterH },
+      svg_viewBox: vb,
+      coords_svg: mapped
     });
   } catch (err) {
     console.error('❌ /extract-svg-crop failed:', err);
@@ -212,9 +215,8 @@ app.post('/extract-svg-crop', upload.any(), async (req, res) => {
   }
 });
 
-// Health check
+// health
 app.get('/', (_, res) => res.send('🟢 PDF-QA API running'));
 
-// Start server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on port ${PORT}`));
